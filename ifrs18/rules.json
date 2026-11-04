@@ -1,0 +1,22 @@
+{
+  "version": "2026-11-04",
+  "rules": [
+    {"names":["매출액","매출","수익(매출액)"],"category":"영업","group":"revenue","refs":["52"],"reason":"주된 재화·용역 판매 수익. 특수 사업활동 여부는 회사 정보로 확인"},
+    {"names":["매출원가"],"category":"영업","group":"cost","refs":["52"],"reason":"재화·용역 판매에 대응하는 원가"},
+    {"names":["판매비와관리비","판매비와 관리비","판매관리비"],"category":"영업","group":"sga","refs":["52"],"reason":"판매·관리 기능 비용. 통합 항목에 재무·투자 성격이 포함되면 분할 검토 필요"},
+    {"names":["지분법이익","지분법손실","지분법손익"],"category":"투자","group":"equity_method","refs":["53","55"],"reason":"지분법 적용 투자자산의 손익은 주된 투자 사업에서도 투자 범주"},
+    {"names":["법인세비용","법인세수익","법인세비용(수익)"],"category":"법인세","group":"tax","refs":["67"],"reason":"제1012호에 따른 계속영업 손익의 법인세. 중단영업 세액이 포함된 통합액은 분리 필요"},
+    {"names":["중단영업손익","중단영업이익","중단영업손실"],"category":"중단영업","group":"discontinued","refs":["68"],"reason":"제1105호의 중단영업 세후 단일 금액임을 입력자가 확인"}
+  ],
+  "source_rules": {
+    "operating_ppe":{"category":"영업","group":"other","refs":["52","B48"],"reason":"다른 자원과 결합해 영업에 사용하는 자산의 처분·손상"},
+    "equity_method":{"category":"투자","group":"equity_method","refs":["53","55"],"reason":"지분법 적용 투자 손익"},
+    "loan_funding":{"category":"재무","group":"loan_interest","refs":["59","60","65"],"reason":"자금조달에만 관련된 차입 부채 손익"},
+    "lease_interest":{"category":"재무","group":"lease_interest","refs":["61","65"],"reason":"리스부채의 식별된 이자비용"},
+    "customer_funding":{"category":"재무","group":"loan_interest","refs":["65"],"reason":"고객 금융제공과 직접 관련된 자금조달"},
+    "cash_equivalent":{"category":"투자","group":"investment","refs":["53","56","57"],"reason":"현금및현금성자산에서 발생한 손익"},
+    "independent_asset":{"category":"투자","group":"investment","refs":["53","54","58"],"reason":"다른 자원과 대부분 독립적으로 수익을 창출하는 자산"},
+    "trade_receivable_fx":{"category":"영업","group":"other","refs":["B65","B66"],"reason":"매출채권에서 발생한 외환차이"},
+    "loan_fx":{"category":"재무","group":"other","refs":["B65","B66","65"],"reason":"자금조달 차입금에서 발생한 외환차이"}
+  }
+}
