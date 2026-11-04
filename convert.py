@@ -17,7 +17,7 @@ from ifrs18.parser import detect,parse
 from ifrs18.engine import classify,RULES
 from ifrs18.ai import recommend
 from ifrs18.batch_ai import classify_batch
-from ifrs18.dart_notes import collect,attach,business_context
+from ifrs18.dart_notes import collect,attach,business_context,sections
 import re
 
 ROOT=Path(__file__).resolve().parent
@@ -45,7 +45,7 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
     prior=bool(mapping.get('previous'))
     # 원본 통합문서를 열어 새 시트만 추가하므로 기존 값·수식·병합·서식을 유지한다.
     w=load_workbook(source)
-    business=''
+    business='';corpus=None
     if download_notes:
         receipts={m for sheet in w for row in sheet for cell in row if isinstance(cell.value,str) for m in re.findall(r'rcpNo=(\d{14})',cell.value)}
         if receipt and receipts and receipts!={receipt}:raise ValueError('입력 재무제표와 요청한 주석 공시의 접수번호가 다릅니다.')
@@ -59,15 +59,17 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
                 attach(items,corpus)
                 business=business_context(corpus)
                 ignored.append('사용 공시: '+corpus['source_url']+' / '+fs_div+' / 관련 발췌는 계정별 원천자료 칸에 기록')
-            except ValueError as exc:ignored.append(str(exc))
+            except ValueError as exc:
+                corpus=None;business=''
+                ignored.append(str(exc))
         else:ignored.append('주석 자동 수집: 입력 파일에 공시 링크가 없습니다. --rcept-no로 사업보고서 접수번호를 지정하세요.')
     decisions={i.id:classify(i,company) for i in items}
     uncertain=[i for i in items if i.role=='detail' and decisions[i.id].category=='판단 보류']
-    batch=classify_batch(uncertain,company,os.getenv('OPENAI_API_KEY'),os.getenv('OPENAI_MODEL',''),business_context=business) if use_ai else {}
+    batch=classify_batch(uncertain,company,os.getenv('OPENAI_API_KEY'),os.getenv('OPENAI_MODEL',''),business_context=business,corpus=corpus) if use_ai else {}
     names=('계정재분류','공시IS_IFRS18','검증결과','분류근거')
     if any(n in w.sheetnames for n in names):raise ValueError('이미 변환 시트가 있습니다. 원본 파일을 선택하세요.')
     review,statement,checks,rules=(w.create_sheet(n) for n in names)
-    review.append(['원본행 ID','계정과목','당기(원)','전기(원)','기존 범주','규칙 분류','AI 추천','판단 근거','기준서 문단','사용한 원천자료','AI 신뢰도','필요한 증빙·추가자료','사용자 최종분류','검토 확인','반영 범주','출력 구분','원본 위치','행유형','입력 오류','검토 상태'])
+    review.append(['원본행 ID','계정과목','당기(원)','전기(원)','기존 범주','규칙 분류','AI 추천','판단 근거','기준서 문단','사용한 원천자료','AI 신뢰도','필요한 증빙·추가자료','사용자 최종분류','검토 확인','반영 범주','출력 구분','원본 위치','행유형','입력 오류','검토 상태','근거 주석·사업보고서 위치'])
     detailrows=[];ocirows=[];netrows=[];metadata=[];audit=[]
     for item in items:
         d=decisions[item.id]; ai,error=batch.get(item.id,(None,''))
@@ -77,7 +79,7 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
         evidence=json.dumps(ai['evidence'],ensure_ascii=False) if ai else item.note or item.description or company.activities
         review.append([item.id,text(item.name),number(item.current),number(item.previous),text(item.old_category),d.category,
                        ai['category'] if ai else '',text(reason),', '.join(ai['paragraphs'] if ai else d.refs),text(evidence),ai['confidence'] if ai else None,
-                       text('; '.join(missing)),'','미검토',None,d.group,text(item.source),item.role,text('; '.join(item.issues)),None])
+                       text('; '.join(missing)),'','미검토',None,d.group,text(item.source),item.role,text('; '.join(item.issues)),None,text('\n'.join(ai.get('source_locations',[]) if ai else []))])
         r=review.max_row
         if auto_apply and ai and ai['category'] in CATEGORIES:
             review.cell(r,14,'자동 적용')
@@ -93,6 +95,14 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
                 netrows.append(r)
                 if item.current is None or (prior and item.previous is None) or item.issues:review.cell(r,20,'입력 확인')
         metadata.append({'item':asdict(item),'decision':asdict(d),'ai':ai,'ai_error':error})
+    # 긴 원문은 Excel 셀 제한 때문에 이어지는 행으로 저장한다. AI 입력은 자르지 않는다.
+    if corpus:
+        sources=w.create_sheet('공시원문근거')
+        sources.append(['문서 ID','위치','공시 링크','이어지는 부분','원문'])
+        for section in sections(corpus):
+            for offset in range(0,len(section['text']),30000):
+                sources.append([text(section['id']),text(section['location']),corpus['source_url'],offset//30000+1,text(section['text'][offset:offset+30000])])
+        sources.freeze_panes='E2';sources.column_dimensions['B'].width=55;sources.column_dimensions['E'].width=110
     end=review.max_row
     dv=DataValidation(type='list',formula1='"'+','.join((*CATEGORIES,'판단 보류'))+'"');dv.error='목록의 범주를 선택하세요.';dv.showErrorMessage=True;dv.errorStyle='stop';review.add_data_validation(dv);dv.add(f'M2:M{end}')
     approval=DataValidation(type='list',formula1='"미검토,확인,자동 적용"');review.add_data_validation(approval);approval.add(f'N2:N{end}')
@@ -157,7 +167,7 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
         for i in range(1,s.max_column+1):
             from openpyxl.utils import get_column_letter
             s.column_dimensions[get_column_letter(i)].width=23
-    for c in ('B','H','J','L'):review.column_dimensions[c].width=48
+    for c in ('B','H','J','L','U'):review.column_dimensions[c].width=48
     review.column_dimensions['I'].width=24;review.column_dimensions['Q'].width=30
     for col in ('M','N'):
         for row in range(2,end+1):review[f'{col}{row}'].fill=PatternFill('solid',fgColor='FFF2CC')
