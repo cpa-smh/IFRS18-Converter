@@ -16,6 +16,9 @@ from ifrs18.models import Company,CATEGORIES
 from ifrs18.parser import detect,parse
 from ifrs18.engine import classify,RULES
 from ifrs18.ai import recommend
+from ifrs18.batch_ai import classify_batch
+from ifrs18.dart_notes import collect,attach,business_context
+import re
 
 ROOT=Path(__file__).resolve().parent
 
@@ -29,7 +32,7 @@ def text(value):
 def number(value):return float(value) if value is not None else None
 
 
-def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='signed'):
+def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='signed',receipt=None,fs_div='CFS',cache_dir=None,download_notes=True,auto_apply=True):
     source=Path(source);output=Path(output)
     if source.resolve()==output.resolve():raise ValueError('원본 보호: 출력 경로를 다르게 지정하세요.')
     if output.exists():raise ValueError('같은 이름의 출력 파일이 이미 있습니다. 새 파일명을 지정하세요.')
@@ -42,15 +45,32 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
     prior=bool(mapping.get('previous'))
     # 원본 통합문서를 열어 새 시트만 추가하므로 기존 값·수식·병합·서식을 유지한다.
     w=load_workbook(source)
+    business=''
+    if download_notes:
+        receipts={m for sheet in w for row in sheet for cell in row if isinstance(cell.value,str) for m in re.findall(r'rcpNo=(\d{14})',cell.value)}
+        if receipt and receipts and receipts!={receipt}:raise ValueError('입력 재무제표와 요청한 주석 공시의 접수번호가 다릅니다.')
+        if not receipt:
+            if len(receipts)==1:receipt=receipts.pop()
+        if receipt:
+            try:
+                corpus=collect(receipt,fs_div,os.getenv('OPENDART_API_KEY'),cache_dir or ROOT/'cache')
+                audit=''.join(d['text'][:12000] for d in corpus['documents'] if d['role']=='audit')
+                if company.name.replace(' ','') not in re.sub(r'\s+','',audit):raise ValueError('주석 감사보고서의 회사명과 입력 기업명이 일치하지 않습니다.')
+                attach(items,corpus)
+                business=business_context(corpus)
+                ignored.append('사용 공시: '+corpus['source_url']+' / '+fs_div+' / 관련 발췌는 계정별 원천자료 칸에 기록')
+            except ValueError as exc:ignored.append(str(exc))
+        else:ignored.append('주석 자동 수집: 입력 파일에 공시 링크가 없습니다. --rcept-no로 사업보고서 접수번호를 지정하세요.')
+    decisions={i.id:classify(i,company) for i in items}
+    uncertain=[i for i in items if i.role=='detail' and decisions[i.id].category=='판단 보류']
+    batch=classify_batch(uncertain,company,os.getenv('OPENAI_API_KEY'),os.getenv('OPENAI_MODEL',''),business_context=business) if use_ai else {}
     names=('계정재분류','공시IS_IFRS18','검증결과','분류근거')
     if any(n in w.sheetnames for n in names):raise ValueError('이미 변환 시트가 있습니다. 원본 파일을 선택하세요.')
     review,statement,checks,rules=(w.create_sheet(n) for n in names)
     review.append(['원본행 ID','계정과목','당기(원)','전기(원)','기존 범주','규칙 분류','AI 추천','판단 근거','기준서 문단','사용한 원천자료','AI 신뢰도','필요한 증빙·추가자료','사용자 최종분류','검토 확인','반영 범주','출력 구분','원본 위치','행유형','입력 오류','검토 상태'])
     detailrows=[];ocirows=[];netrows=[];metadata=[];audit=[]
     for item in items:
-        d=classify(item,company); ai=None;error=''
-        if item.role=='detail' and d.category=='판단 보류' and use_ai:
-            ai,error=recommend(item,company,os.getenv('OPENAI_API_KEY'),os.getenv('OPENAI_MODEL',''))
+        d=decisions[item.id]; ai,error=batch.get(item.id,(None,''))
         missing=ai['required_information'] if ai else (['발생 원천별 계정명세·관련 주석. 외환손익은 채권/차입금 등 원천과 금액 구분'] if d.category=='판단 보류' else [])
         reason=ai['reason'] if ai else d.reason
         if error:reason+=' / '+error
@@ -59,10 +79,12 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
                        ai['category'] if ai else '',text(reason),', '.join(ai['paragraphs'] if ai else d.refs),text(evidence),ai['confidence'] if ai else None,
                        text('; '.join(missing)),'','미검토',None,d.group,text(item.source),item.role,text('; '.join(item.issues)),None])
         r=review.max_row
+        if auto_apply and ai and ai['category'] in CATEGORIES:
+            review.cell(r,14,'자동 적용')
         if item.role=='detail':
             detailrows.append(r)
             review.cell(r,15,f'=IF(M{r}<>"",M{r},IF(F{r}<>"판단 보류",F{r},IF(G{r}<>"",G{r},"판단 보류")))')
-            review.cell(r,20,f'=IF(OR(S{r}<>"",NOT(ISNUMBER(C{r})){",NOT(ISNUMBER(D"+str(r)+"))" if prior else ""}),"입력 확인",IF(COUNTIFS(\'분류근거\'!$H$2:$H$6,O{r})<>1,"판단 보류",IF(AND(M{r}="",F{r}<>"판단 보류"),"규칙 적용",IF(N{r}="확인","확인 완료","미검토"))))')
+            review.cell(r,20,f'=IF(OR(S{r}<>"",NOT(ISNUMBER(C{r})){",NOT(ISNUMBER(D"+str(r)+"))" if prior else ""}),"입력 확인",IF(COUNTIFS(\'분류근거\'!$H$2:$H$6,O{r})<>1,"판단 보류",IF(AND(M{r}="",F{r}<>"판단 보류"),"규칙 적용",IF(OR(N{r}="확인",N{r}="자동 적용"),"확인 완료","미검토"))))')
         elif item.role=='oci':
             ocirows.append(r);review.cell(r,15,'OCI');review.cell(r,20,'별도 표시' if item.current is not None and (not prior or item.previous is not None) and not item.issues else '입력 확인')
         else:
@@ -73,7 +95,7 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
         metadata.append({'item':asdict(item),'decision':asdict(d),'ai':ai,'ai_error':error})
     end=review.max_row
     dv=DataValidation(type='list',formula1='"'+','.join((*CATEGORIES,'판단 보류'))+'"');dv.error='목록의 범주를 선택하세요.';dv.showErrorMessage=True;dv.errorStyle='stop';review.add_data_validation(dv);dv.add(f'M2:M{end}')
-    approval=DataValidation(type='list',formula1='"미검토,확인"');review.add_data_validation(approval);approval.add(f'N2:N{end}')
+    approval=DataValidation(type='list',formula1='"미검토,확인,자동 적용"');review.add_data_validation(approval);approval.add(f'N2:N{end}')
     rules.append(['유형','조건/계정','분류','판단 요약','문단','기준 확인일','공식 출처','선택 범주'])
     for idx,c in enumerate(CATEGORIES,2):rules.cell(idx,8,c)
     sourceurl='https://kasb.or.kr/front/board/comm010View.do?seq=2101'
@@ -100,7 +122,7 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
         for r,f in formulas.items():statement.cell(r,col,'='+f)
     checks.append(['검증 항목','당기','전기','설명'])
     pending=f'COUNTIFS(\'계정재분류\'!$T$2:$T${end},"미검토")+COUNTIFS(\'계정재분류\'!$T$2:$T${end},"판단 보류")+COUNTIFS(\'계정재분류\'!$T$2:$T${end},"입력 확인")'
-    checks.append(['미완료 계정 수','='+pending,None,'AI 추천은 사용자 최종분류/확인 후 검토 완료. 규칙 적용은 자동 처리'])
+    checks.append(['미완료 계정 수','='+pending,None,'근거 검증을 통과한 AI 분류는 자동 적용. 근거 부족·통합 계정은 보류'])
     for col,field in ((2,'C'),(3,'D')):
         if col==3 and not prior:continue
         checks.cell(3,1,'원본 상세 합계 - 원본 순손익')
@@ -150,6 +172,11 @@ def convert(source,output,company,mapping=None,use_ai=True,scale=1,sign_mode='si
     checks.column_dimensions['A'].width=40;checks.column_dimensions['D'].width=82
     rules.column_dimensions['B'].width=46;rules.column_dimensions['D'].width=70;rules.column_dimensions['G'].width=62
     w.calculation=CalcProperties(fullCalcOnLoad=True,forceFullCalc=True)
+    if auto_apply:
+        for sheet in (statement,checks):
+            for row in sheet:
+                for cell in row:
+                    if isinstance(cell.value,str):cell.value=cell.value.replace('검토 완료','자동 분류 완료')
     output.parent.mkdir(parents=True,exist_ok=True);w.save(output)
     return {'file':str(output),'accounts':len(detailrows),'ai_calls':sum(x['ai'] is not None or bool(x['ai_error']) for x in metadata),'items':metadata}
 
@@ -161,6 +188,9 @@ def main(argv=None):
     p.add_argument('--industry',default='제조업');p.add_argument('--activities',required=True)
     p.add_argument('--sheet');p.add_argument('--header-row',type=int);p.add_argument('--account-col');p.add_argument('--current-col');p.add_argument('--previous-col')
     p.add_argument('--no-ai',action='store_true');p.add_argument('--scale',default='1');p.add_argument('--expenses-positive',action='store_true')
+    p.add_argument('--rcept-no',help='사업보고서 접수번호 14자리. 입력 공시 링크에서 자동 인식 가능')
+    p.add_argument('--fs-div',choices=('CFS','OFS'),default='CFS')
+    p.add_argument('--cache-dir',type=Path,default=ROOT/'cache');p.add_argument('--no-documents',action='store_true')
     p.add_argument('--invests-assets',action='store_true');p.add_argument('--invests-financial-assets',action='store_true');p.add_argument('--finances-customers',action='store_true')
     a=p.parse_args(argv);load_dotenv(ROOT/'.env')
     try:
@@ -172,7 +202,7 @@ def main(argv=None):
             # 선택한 헤더행에서 주석·설명 열도 인식한다.
             found=[c for c in detect(a.input,a.sheet) if c['header_row']==a.header_row]
             if len(found)==1:mapping={**found[0],**mapping}
-        result=convert(a.input,a.output,Company(a.company,a.year,a.industry,a.activities,a.invests_assets,a.invests_financial_assets,a.finances_customers),mapping,not a.no_ai,a.scale,'expenses_positive' if a.expenses_positive else 'signed')
+        result=convert(a.input,a.output,Company(a.company,a.year,a.industry,a.activities,a.invests_assets,a.invests_financial_assets,a.finances_customers),mapping,not a.no_ai,a.scale,'expenses_positive' if a.expenses_positive else 'signed',a.rcept_no,a.fs_div,a.cache_dir,not a.no_documents)
         print(f'저장: {result["file"]} / 상세 계정 {result["accounts"]}개')
         return 0
     except (ValueError,KeyError) as e:
